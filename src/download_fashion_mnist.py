@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Download Fashion-MNIST IDX gzip files with MD5 verification."""
+# uv run src/download_fashion_mnist.py
 
 from __future__ import annotations
 

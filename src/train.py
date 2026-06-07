@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Train a simple demo model on Fashion-MNIST and save as pickle."""
+# uv run src/train.py
 
 import pickle
 from pathlib import Path

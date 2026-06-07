@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Fashion-MNIST IDX gzip loader."""
-
 import gzip
 import struct
 from pathlib import Path
@@ -50,12 +47,6 @@ def _read_idx_labels(path: Path) -> np.ndarray:
             f"Label count mismatch: header={num_labels}, actual={labels.shape[0]} ({path})"
         )
     return labels
-
-
-def _to_one_hot(labels: np.ndarray, num_classes: int = 10) -> np.ndarray:
-    one_hot = np.zeros((labels.size, num_classes), dtype=np.float32)
-    one_hot[np.arange(labels.size), labels] = 1.0
-    return one_hot
 
 
 def _preprocess_images(images: np.ndarray) -> np.ndarray:

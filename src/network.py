@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Simple MLP network for Fashion-MNIST demo."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

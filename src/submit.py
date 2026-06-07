@@ -1,17 +1,14 @@
-#!/usr/bin/env python3
-"""Load trained model pickle and report validation results."""
+# uv run src/submit.py
 
-import csv
 import pickle
 from pathlib import Path
 
 import numpy as np
 
-from load_fashion_mnist import load_eval_data
+from load_fashion_mnist import load_test_data
 from network import SimpleMLP
 
 WEIGHTS_PATH = Path("sample_weight.pkl")
-PREDICTION_CSV = Path("validation_predictions.csv")
 
 
 def main() -> int:
@@ -24,19 +21,11 @@ def main() -> int:
 
     model = SimpleMLP.from_state(state)
 
-    x_valid, t_valid = load_eval_data()
+    x_test, t_test = load_test_data()
 
-    pred = model.predict(x_valid)
-    acc = float(np.mean(pred == t_valid))
-    print(f"Validation Accuracy: {acc:.6f}")
-
-    with PREDICTION_CSV.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["index", "label", "prediction", "correct"])
-        for idx, (label, prediction) in enumerate(zip(t_valid, pred)):
-            writer.writerow([idx, int(label), int(prediction), int(label == prediction)])
-
-    print(f"Saved validation predictions: {PREDICTION_CSV.resolve()}")
+    pred = model.predict(x_test)
+    acc = float(np.mean(pred == t_test))
+    print(f"Test Accuracy: {acc:.6f}")
     return 0
 
 

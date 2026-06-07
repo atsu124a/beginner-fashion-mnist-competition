@@ -10,5 +10,3 @@ __pycache__/
 .DS_Store
 # data
 data/
-*.pkl
-*.csv

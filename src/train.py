@@ -16,7 +16,7 @@ from network import TorchFastCNN
 
 OUTPUT_PATH = Path("sample_weight.pkl")
 EPOCHS = 38
-SEEDS = (42, 123, 777)
+SEEDS = (42, 123, 777, 2026, 31415, 27182)
 BATCH_SIZE = 512
 LEARNING_RATE = 1.4e-3
 MIN_LR = 1.5e-5
@@ -27,6 +27,9 @@ DROPOUT = 0.20
 LABEL_SMOOTHING = 0.02
 MIXUP_ALPHA = 0.20
 EMA_DECAY = 0.997
+FINETUNE_EXISTING = True
+FINETUNE_EPOCHS = 8
+FINETUNE_LR = 2.0e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = DEVICE.type == "cuda"
 
@@ -161,6 +164,35 @@ def save_states(states: list[dict[str, np.ndarray]], mean: float, std: float) ->
     print(f"Saved {len(states)} model(s): {OUTPUT_PATH.resolve()}", flush=True)
 
 
+def load_existing_states() -> tuple[list[dict[str, np.ndarray]], float, float]:
+    if not OUTPUT_PATH.exists():
+        return [], 0.0, 1.0
+    try:
+        with OUTPUT_PATH.open("rb") as f:
+            state = pickle.load(f)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Existing weight ignored: {exc}", flush=True)
+        return [], 0.0, 1.0
+
+    if not isinstance(state, dict) or state.get("model_type") != "TorchEnsembleCNN":
+        return [], 0.0, 1.0
+    if state.get("arch") != "fast" or int(state.get("width", 0)) != WIDTH:
+        return [], 0.0, 1.0
+    if int(state.get("hidden_size", 0)) != HIDDEN_SIZE:
+        return [], 0.0, 1.0
+
+    states_obj = state.get("states")
+    if not isinstance(states_obj, list):
+        return [], 0.0, 1.0
+    states: list[dict[str, np.ndarray]] = []
+    for item in states_obj:
+        if isinstance(item, dict):
+            states.append({str(k): v for k, v in item.items() if isinstance(v, np.ndarray)})
+    if states:
+        print(f"Resuming from {len(states)} saved model(s)", flush=True)
+    return states, float(state.get("mean", 0.0)), float(state.get("std", 1.0))
+
+
 def train_one(
     seed: int,
     x_fit: np.ndarray,
@@ -234,15 +266,98 @@ def train_one(
     return state_to_numpy(model), mean, std
 
 
+def fine_tune_one(
+    seed: int,
+    state: dict[str, np.ndarray],
+    x_fit: np.ndarray,
+    t_fit: np.ndarray,
+    x_valid: np.ndarray,
+    t_valid: np.ndarray,
+) -> tuple[dict[str, np.ndarray], float, float]:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    mean = float(x_fit.mean())
+    std = float(x_fit.std() + 1e-6)
+    print(f"fine-tune device={DEVICE} amp={USE_AMP} seed={seed}", flush=True)
+
+    x_tensor = torch.from_numpy(x_fit.reshape(-1, 1, 28, 28).astype(np.float32))
+    y_tensor = torch.from_numpy(t_fit.astype(np.int64))
+    xv_tensor = torch.from_numpy(x_valid.reshape(-1, 1, 28, 28).astype(np.float32))
+    yv_tensor = torch.from_numpy(t_valid.astype(np.int64))
+
+    loader = DataLoader(
+        TensorDataset(x_tensor, y_tensor),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=False,
+        pin_memory=DEVICE.type == "cuda",
+    )
+    model = TorchFastCNN(width=WIDTH, hidden_size=HIDDEN_SIZE, dropout=DROPOUT).to(DEVICE)
+    model.load_state_dict({key: torch.from_numpy(value) for key, value in state.items()})
+    model = model.to(memory_format=torch.channels_last)
+    ema_params = {name: param.detach().clone() for name, param in model.named_parameters()}
+    optimizer = torch.optim.AdamW(model.parameters(), lr=FINETUNE_LR, weight_decay=WEIGHT_DECAY * 0.5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=FINETUNE_EPOCHS, eta_min=MIN_LR
+    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.005)
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+
+    for epoch in range(1, FINETUNE_EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        total = 0
+        for xb, yb in loader:
+            xb = xb.to(DEVICE, non_blocking=True)
+            yb = yb.to(DEVICE, non_blocking=True)
+            xb = xb.contiguous(memory_format=torch.channels_last)
+            xb = augment_batch(xb)
+            xb = (xb - mean) / std
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=USE_AMP):
+                loss = criterion(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            update_ema(ema_params, model)
+
+            total_loss += float(loss.item()) * int(yb.numel())
+            total += int(yb.numel())
+        scheduler.step()
+        valid_acc = evaluate(model, xv_tensor, yv_tensor, mean, std)
+        print(
+            f"FineTune {epoch:02d}/{FINETUNE_EPOCHS} "
+            f"loss={total_loss / total:.4f} valid_acc={valid_acc:.4f}",
+            flush=True,
+        )
+
+    apply_ema(ema_params, model)
+    refresh_batch_norm(model, x_tensor, mean, std)
+    valid_acc = evaluate(model, xv_tensor, yv_tensor, mean, std)
+    print(f"FineTune EMA refreshed valid_acc={valid_acc:.4f}", flush=True)
+    return state_to_numpy(model), mean, std
+
+
 def main() -> int:
     (x_train, t_train), (x_valid, t_valid) = load_train_data()
     x_fit = np.concatenate([x_train, x_valid], axis=0)
     t_fit = np.concatenate([t_train, t_valid], axis=0)
 
-    states: list[dict[str, np.ndarray]] = []
-    mean = 0.0
-    std = 1.0
-    for index, seed in enumerate(SEEDS, start=1):
+    states, mean, std = load_existing_states()
+    if FINETUNE_EXISTING and len(states) == len(SEEDS):
+        tuned_states: list[dict[str, np.ndarray]] = []
+        for index, (seed, state) in enumerate(zip(SEEDS, states), start=1):
+            print(f"\nFine-tuning saved model {index}/{len(states)} seed={seed}", flush=True)
+            tuned_state, mean, std = fine_tune_one(seed + 100000, state, x_fit, t_fit, x_valid, t_valid)
+            tuned_states.append(tuned_state)
+            save_states(tuned_states + states[index:], mean, std)
+        return 0
+
+    start_index = len(states)
+    for index, seed in enumerate(SEEDS[start_index:], start=start_index + 1):
         print(f"\nTorch Fast CNN {index}/{len(SEEDS)} seed={seed}", flush=True)
         state, mean, std = train_one(seed, x_fit, t_fit, x_valid, t_valid)
         states.append(state)

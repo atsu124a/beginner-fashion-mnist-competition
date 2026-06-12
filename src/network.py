@@ -351,6 +351,10 @@ class SimpleCNN:
             (1, 0, False),
             (0, -1, False),
             (0, 1, False),
+            (-1, -1, False),
+            (-1, 1, False),
+            (1, -1, False),
+            (1, 1, False),
         )
         probs = [
             self._predict_proba_once(_transform_flat_images(x, dy=dy, dx=dx, flip=flip))
@@ -724,6 +728,10 @@ class TorchEnsembleModel:
             (1, 0, False),
             (0, -1, False),
             (0, 1, False),
+            (-1, -1, False),
+            (-1, 1, False),
+            (1, -1, False),
+            (1, 1, False),
         )
         probs = [
             self._predict_one_transform(_transform_flat_images(x, dy=dy, dx=dx, flip=flip))

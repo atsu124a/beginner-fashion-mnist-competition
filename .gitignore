@@ -4,6 +4,7 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .venv/
+.uv-cache/
 # vscode
 .vscode/
 # mac
@@ -11,3 +12,13 @@ __pycache__/
 # data
 data/
 sample_weight_*_backup.pkl
+sample_weight_weightsearch_tmp.pkl
+sample_weight_candidate.pkl
+per_model_probs_cache.npz
+class_weight_search_tmp.npz
+meta_stack_tmp.npz
+meta_mlp_tmp.npz
+train_*.log
+train_*.err
+spawn_*.log
+spawn_*.err

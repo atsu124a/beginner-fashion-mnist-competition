@@ -668,6 +668,103 @@ if nn is not None:
             return self.classifier(self.features(x))
 
 
+    class WideBasicBlock(nn.Module):
+        def __init__(self, in_channels: int, out_channels: int, stride: int, dropout: float) -> None:
+            super().__init__()
+            self.bn1 = nn.BatchNorm2d(in_channels)
+            self.conv1 = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                bias=False,
+            )
+            self.bn2 = nn.BatchNorm2d(out_channels)
+            self.conv2 = nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            )
+            self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
+            if stride != 1 or in_channels != out_channels:
+                self.shortcut = nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                )
+            else:
+                self.shortcut = nn.Identity()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = F.relu(self.bn1(x), inplace=True)
+            shortcut = self.shortcut(out if not isinstance(self.shortcut, nn.Identity) else x)
+            out = self.conv1(out)
+            out = self.dropout(F.relu(self.bn2(out), inplace=True))
+            out = self.conv2(out)
+            return out + shortcut
+
+
+    class TorchWideResNet(nn.Module):
+        def __init__(self, depth: int = 28, widen_factor: int = 4, dropout: float = 0.10) -> None:
+            super().__init__()
+            if (depth - 4) % 6 != 0:
+                raise ValueError("WideResNet depth must satisfy depth = 6n + 4")
+            blocks_per_stage = (depth - 4) // 6
+            channels = (16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor)
+            self.depth = int(depth)
+            self.widen_factor = int(widen_factor)
+            self.conv1 = nn.Conv2d(1, channels[0], kernel_size=3, padding=1, bias=False)
+            self.stage1 = self._make_stage(
+                blocks_per_stage, channels[0], channels[1], stride=1, dropout=dropout
+            )
+            self.stage2 = self._make_stage(
+                blocks_per_stage, channels[1], channels[2], stride=2, dropout=dropout
+            )
+            self.stage3 = self._make_stage(
+                blocks_per_stage, channels[2], channels[3], stride=2, dropout=dropout
+            )
+            self.bn = nn.BatchNorm2d(channels[3])
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.fc = nn.Linear(channels[3], 10)
+
+            for module in self.modules():
+                if isinstance(module, nn.Conv2d):
+                    nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                elif isinstance(module, nn.BatchNorm2d):
+                    nn.init.ones_(module.weight)
+                    nn.init.zeros_(module.bias)
+                elif isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    nn.init.zeros_(module.bias)
+
+        @staticmethod
+        def _make_stage(
+            blocks: int,
+            in_channels: int,
+            out_channels: int,
+            stride: int,
+            dropout: float,
+        ) -> nn.Sequential:
+            layers = [WideBasicBlock(in_channels, out_channels, stride, dropout)]
+            for _ in range(1, blocks):
+                layers.append(WideBasicBlock(out_channels, out_channels, 1, dropout))
+            return nn.Sequential(*layers)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.conv1(x)
+            x = self.stage1(x)
+            x = self.stage2(x)
+            x = self.stage3(x)
+            x = F.relu(self.bn(x), inplace=True)
+            x = self.pool(x).flatten(1)
+            return self.fc(x)
+
+
 class TorchEnsembleModel:
     def __init__(
         self,
@@ -680,6 +777,9 @@ class TorchEnsembleModel:
         use_tta: bool = True,
         arch: str = "resnet",
         hidden_size: int = 512,
+        depth: int = 28,
+        state_weights: list[float] | np.ndarray | None = None,
+        meta_mlp: dict[str, np.ndarray] | None = None,
     ) -> None:
         if torch is None or nn is None:
             raise ImportError("TorchEnsembleModel requires torch to be installed")
@@ -690,12 +790,45 @@ class TorchEnsembleModel:
         self.use_tta = bool(use_tta)
         self.arch = arch
         self.hidden_size = int(hidden_size)
+        self.depth = int(depth)
         self.models: list[Any] = []
         self.config = NetworkConfig(batch_size=batch_size, use_tta=use_tta)
+        if state_weights is None:
+            weights = np.ones(len(states), dtype=np.float32)
+        else:
+            weights = np.asarray(state_weights, dtype=np.float32)
+            if weights.shape != (len(states),):
+                raise ValueError("state_weights length must match states length")
+            if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0.0:
+                raise ValueError("state_weights must be finite with a positive sum")
+        self.state_weights = (weights / weights.sum()).astype(np.float32)
+        self._torch_state_weights = torch.from_numpy(self.state_weights).to(self.device)
+        self.meta_mlp: dict[str, torch.Tensor] | None = None
+        if meta_mlp is not None:
+            required = {
+                "0.weight",
+                "0.bias",
+                "3.weight",
+                "3.bias",
+                "6.weight",
+                "6.bias",
+            }
+            if set(meta_mlp) != required:
+                raise ValueError("Invalid meta_mlp state")
+            self.meta_mlp = {
+                key: torch.from_numpy(value.astype(np.float32)).to(self.device)
+                for key, value in meta_mlp.items()
+            }
 
         for state in states:
             if arch == "fast":
                 model = TorchFastCNN(width=width, hidden_size=hidden_size, dropout=dropout).to(self.device)
+            elif arch == "wrn":
+                model = TorchWideResNet(
+                    depth=self.depth,
+                    widen_factor=width,
+                    dropout=dropout,
+                ).to(self.device)
             else:
                 model = TorchFashionCNN(width=width, dropout=dropout).to(self.device)
             torch_state = {
@@ -706,21 +839,77 @@ class TorchEnsembleModel:
             model.eval()
             self.models.append(model)
 
-    def _predict_one_transform(self, x: np.ndarray) -> np.ndarray:
+    def _predict_single_model_transform(self, model: nn.Module, x: np.ndarray) -> np.ndarray:
         outputs: list[np.ndarray] = []
         with torch.no_grad():
             for start in range(0, x.shape[0], self.batch_size):
                 batch = x[start : start + self.batch_size].reshape(-1, 1, 28, 28).astype(np.float32)
                 xb = torch.from_numpy(batch).to(self.device, non_blocking=True)
                 xb = (xb - self.mean) / self.std
-                probs = []
-                for model in self.models:
-                    probs.append(torch.softmax(model(xb), dim=1))
-                avg = torch.stack(probs, dim=0).mean(dim=0)
-                outputs.append(avg.detach().cpu().numpy())
+                probs = torch.softmax(model(xb), dim=1)
+                outputs.append(probs.detach().cpu().numpy())
         return np.concatenate(outputs, axis=0)
 
+    def _predict_one_transform(self, x: np.ndarray) -> np.ndarray:
+        probs = [
+            self._predict_single_model_transform(model, x)
+            for model in self.models
+        ]
+        stacked_np = np.stack(probs, axis=0)
+        avg = (stacked_np * self.state_weights[:, None, None]).sum(axis=0)
+        return avg.astype(np.float32)
+
+    def _predict_single_model_proba(self, model: nn.Module, x: np.ndarray) -> np.ndarray:
+        transforms = ((0, 0, False),) if not self.use_tta else (
+            (0, 0, False),
+            (0, 0, True),
+            (-1, 0, False),
+            (1, 0, False),
+            (0, -1, False),
+            (0, 1, False),
+            (-1, -1, False),
+            (-1, 1, False),
+            (1, -1, False),
+            (1, 1, False),
+        )
+        probs = [
+            self._predict_single_model_transform(
+                model,
+                _transform_flat_images(x, dy=dy, dx=dx, flip=flip),
+            )
+            for dy, dx, flip in transforms
+        ]
+        return np.mean(probs, axis=0).astype(np.float32)
+
+    def _meta_forward(self, features: torch.Tensor) -> torch.Tensor:
+        if self.meta_mlp is None:
+            raise ValueError("meta_mlp is not configured")
+        features = F.linear(features, self.meta_mlp["0.weight"], self.meta_mlp["0.bias"])
+        features = F.relu(features)
+        features = F.dropout(features, p=0.0, training=False)
+        features = F.linear(features, self.meta_mlp["3.weight"], self.meta_mlp["3.bias"])
+        features = F.relu(features)
+        features = F.dropout(features, p=0.0, training=False)
+        return F.linear(features, self.meta_mlp["6.weight"], self.meta_mlp["6.bias"])
+
+    def _predict_meta_proba(self, x: np.ndarray) -> np.ndarray:
+        per_model = [
+            self._predict_single_model_proba(model, x)
+            for model in self.models
+        ]
+        features_np = np.stack(per_model, axis=1).reshape(x.shape[0], -1).astype(np.float32)
+        outputs: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, features_np.shape[0], self.batch_size):
+                xb = torch.from_numpy(features_np[start : start + self.batch_size]).to(self.device)
+                probs = torch.softmax(self._meta_forward(xb), dim=1)
+                outputs.append(probs.detach().cpu().numpy())
+        return np.concatenate(outputs, axis=0).astype(np.float32)
+
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        if self.meta_mlp is not None:
+            return self._predict_meta_proba(x)
+
         transforms = ((0, 0, False),) if not self.use_tta else (
             (0, 0, False),
             (0, 0, True),
@@ -749,6 +938,8 @@ class TorchEnsembleModel:
         width = (
             self.models[0].features[0].out_channels
             if self.arch == "fast"
+            else self.models[0].widen_factor
+            if self.arch == "wrn"
             else self.models[0].stem.conv.out_channels
         )
         return {
@@ -760,10 +951,19 @@ class TorchEnsembleModel:
                 }
                 for model in self.models
             ],
+            "state_weights": self.state_weights,
+            "meta_mlp": {
+                key: value.detach().cpu().numpy().astype(np.float32)
+                for key, value in self.meta_mlp.items()
+            }
+            if self.meta_mlp is not None
+            else None,
             "mean": self.mean,
             "std": self.std,
             "width": width,
             "arch": self.arch,
+            "depth": self.models[0].depth if self.arch == "wrn" else None,
+            "widen_factor": width if self.arch == "wrn" else None,
             "hidden_size": self.hidden_size,
             "dropout": 0.0,
             "batch_size": self.batch_size,
@@ -789,7 +989,18 @@ class TorchEnsembleModel:
             batch_size=int(state.get("batch_size", 512)),
             use_tta=bool(state.get("use_tta", True)),
             arch=str(state.get("arch", "resnet")),
+            depth=int(state.get("depth", 28)) if str(state.get("arch", "resnet")) == "wrn" else 28,
             hidden_size=int(state.get("hidden_size", 512)),
+            state_weights=state.get("state_weights")
+            if isinstance(state.get("state_weights"), (list, tuple, np.ndarray))
+            else None,
+            meta_mlp={
+                str(key): value
+                for key, value in state.get("meta_mlp", {}).items()
+                if isinstance(value, np.ndarray)
+            }
+            if isinstance(state.get("meta_mlp"), dict)
+            else None,
         )
 
 

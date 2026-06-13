@@ -832,7 +832,7 @@ class TorchEnsembleModel:
             else:
                 model = TorchFashionCNN(width=width, dropout=dropout).to(self.device)
             torch_state = {
-                key: torch.from_numpy(value).to(self.device)
+                key: torch.from_numpy(value.astype(np.float32, copy=False)).to(self.device)
                 for key, value in state.items()
             }
             model.load_state_dict(torch_state)
@@ -1004,12 +1004,74 @@ class TorchEnsembleModel:
         )
 
 
+class HeteroTorchEnsembleModel:
+    def __init__(self, groups: list[dict[str, object]]) -> None:
+        if not groups:
+            raise ValueError("HeteroTorchEnsembleModel requires at least one group")
+        self.groups: list[tuple[float, TorchEnsembleModel]] = []
+        total_weight = 0.0
+        for group in groups:
+            weight = float(group.get("weight", 1.0))
+            if weight <= 0.0:
+                continue
+            states_obj = group.get("states")
+            if not isinstance(states_obj, list):
+                raise ValueError("Invalid HeteroTorchEnsemble group: 'states' must be a list")
+            states = [
+                {str(key): value for key, value in item.items() if isinstance(value, np.ndarray)}
+                for item in states_obj
+                if isinstance(item, dict)
+            ]
+            model = TorchEnsembleModel(
+                states=states,
+                mean=float(group.get("mean", 0.0)),
+                std=float(group.get("std", 1.0)),
+                width=int(group.get("width", 64)),
+                dropout=float(group.get("dropout", 0.0)),
+                batch_size=int(group.get("batch_size", 1024)),
+                use_tta=bool(group.get("use_tta", True)),
+                arch=str(group.get("arch", "resnet")),
+                hidden_size=int(group.get("hidden_size", 512)),
+                depth=int(group.get("depth", 28) or 28),
+            )
+            self.groups.append((weight, model))
+            total_weight += weight
+        if total_weight <= 0.0 or not self.groups:
+            raise ValueError("HeteroTorchEnsembleModel requires positive group weights")
+        self.total_weight = total_weight
+        self.config = self.groups[0][1].config
+
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        probs = None
+        for weight, model in self.groups:
+            weighted = weight * model.predict_proba(x)
+            probs = weighted if probs is None else probs + weighted
+        if probs is None:
+            raise RuntimeError("No heterogenous ensemble groups were available")
+        return (probs / self.total_weight).astype(np.float32)
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return np.argmax(self.predict_proba(x), axis=1)
+
+    def evaluate_accuracy(self, x: np.ndarray, y: np.ndarray) -> float:
+        return float(np.mean(self.predict(x) == y))
+
+    @classmethod
+    def from_state(cls, state: dict[str, object]) -> "HeteroTorchEnsembleModel":
+        groups = state.get("groups")
+        if not isinstance(groups, list):
+            raise ValueError("Invalid HeteroTorchEnsemble state: 'groups' must be a list")
+        return cls([group for group in groups if isinstance(group, dict)])
+
+
 class SimpleMLP:
     @classmethod
     def from_state(cls, state: dict[str, object]) -> Any:
         model_type = state.get("model_type")
         if model_type == "TorchEnsembleCNN":
             return TorchEnsembleModel.from_state(state)
+        if model_type == "HeteroTorchEnsemble":
+            return HeteroTorchEnsembleModel.from_state(state)
         if model_type == "SimpleCNN":
             return SimpleCNN.from_state(state)
         if model_type in {"EnsembleModel", "EnsembleMLP"}:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pickle
-import subprocess
 import time
 from pathlib import Path
 
@@ -49,8 +48,6 @@ USE_RANDOM_AFFINE = False
 USE_SWA = True
 SWA_START_EPOCH = 26
 OPTIMIZE_ENSEMBLE_WEIGHTS = True
-GPU_TEMP_LIMIT_C = 78
-GPU_COOLDOWN_SECONDS = 45
 BATCH_SLEEP_SECONDS = 0.005
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = DEVICE.type == "cuda"
@@ -59,38 +56,6 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 torch.set_num_threads(4)
-
-
-def get_gpu_temperature() -> int | None:
-    if DEVICE.type != "cuda":
-        return None
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    first = out.strip().splitlines()[0] if out.strip() else ""
-    try:
-        return int(first)
-    except ValueError:
-        return None
-
-
-def cool_down_if_needed() -> None:
-    temp = get_gpu_temperature()
-    if temp is not None and temp >= GPU_TEMP_LIMIT_C:
-        print(
-            f"GPU temp {temp}C >= {GPU_TEMP_LIMIT_C}C; cooling down for {GPU_COOLDOWN_SECONDS}s",
-            flush=True,
-        )
-        time.sleep(GPU_COOLDOWN_SECONDS)
 
 
 def augment_batch(x: torch.Tensor) -> torch.Tensor:
@@ -619,8 +584,6 @@ def train_one(
             total += int(yb.numel())
             if BATCH_SLEEP_SECONDS > 0.0:
                 time.sleep(BATCH_SLEEP_SECONDS)
-            if step % 20 == 0:
-                cool_down_if_needed()
         scheduler.step()
         if USE_SWA and epoch >= SWA_START_EPOCH:
             swa_params, swa_count = update_swa(swa_params, model, swa_count)
@@ -720,8 +683,6 @@ def fine_tune_one(
             total += int(yb.numel())
             if BATCH_SLEEP_SECONDS > 0.0:
                 time.sleep(BATCH_SLEEP_SECONDS)
-            if step % 20 == 0:
-                cool_down_if_needed()
         scheduler.step()
         valid_acc = evaluate(model, xv_tensor, yv_tensor, mean, std)
         print(
